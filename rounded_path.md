@@ -7,10 +7,11 @@ TODO: add image.
 
 # Configuration
 
-```
+```salt
 [rounded_path]
-resolution: 0.2 # the length of a circle approximation segments.
-replace_g0: False # Use at your own risk
+resolution: 0.2 [1] # the length of a circle approximation segments.
+replace_g0: True/False   [False] # Use at your own risk
+algorithm: fillet/bezier [fillet] # algorithm for curves/path rounding
 ```
 
 # Gcodes
@@ -24,12 +25,12 @@ next position. `Distance` is the maxiumum deflection distance from this point.
 
 Example usage:
 ```
-    ROUNDED_G0 Y=30 D=5 F=1000
-    ROUNDED_G0 X=100 D=30
-    ROUNDED_G0 Y=100 D=30
-    ROUNDED_G0 X=200 D=30
-    ROUNDED_G0 Y=200 D=30
-    ROUNDED_G0 X=100 Y=100 Z=10 D=0     
+ROUNDED_G0 Y=30 D=5 F=1000
+ROUNDED_G0 X=100 D=30
+ROUNDED_G0 Y=100 D=30
+ROUNDED_G0 X=200 D=30
+ROUNDED_G0 Y=200 D=30
+ROUNDED_G0 X=100 Y=100 Z=10 D=0 
 ```
 The rounded path chain **must always end with D=0** to allow computing the final move.
 

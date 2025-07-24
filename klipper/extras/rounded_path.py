@@ -14,6 +14,11 @@ import math
 EPSILON = 0.001
 EPSILON_ANGLE = 0.001
 
+try:
+    import numpy as np
+except ModuleNotFoundError:
+    np = None
+
 class ControlPoint:
     def __init__(self, x, y, z, d, f):
         self.vec = [x,y,z]
@@ -88,6 +93,11 @@ class RoundedPath:
         self.printer = config.get_printer()
         self.mm_per_arc_segment = config.getfloat('resolution', 1., above=0.0)
 
+        algo_options = {'fillet': 'fillet', 'bezier': 'bezier'}
+        self.algorithm = config.getchoice('algorithm', algo_options, 'fillet')
+        if self.algorithm == 'bezier' and np is None:
+            raise config.error("rounded_path: algorithm: 'bezier' requires the 'numpy' to be installed.")
+        
         self.gcode_move = self.printer.load_object(config, 'gcode_move')
         self.gcode = self.printer.lookup_object('gcode')
         self.G0_params = {}
@@ -212,11 +222,17 @@ class RoundedPath:
                 p1.lin_d = 0
                 continue
             # that was not enough, reduce both proportionally
-            missingr_shared = missingd / (1/p0.lin_d_to_r + 1/p1.lin_d_to_r)
+            missingr_shared = missingd / (1.0 / p0.lin_d_to_r + 1.0 / p1.lin_d_to_r)
             p0.lin_d = max(0.0, p0.lin_d - missingr_shared / p0.lin_d_to_r)
             p1.lin_d = max(0.0, p1.lin_d - missingr_shared / p1.lin_d_to_r)
 
-    def _arc(self, c:ControlPoint, p:ControlPoint, n:ControlPoint):
+    def _arc(self, c: ControlPoint, p: ControlPoint, n: ControlPoint):
+        if self.algorithm == 'bezier':
+            self._arc_bezier(c, p, n)
+        else:
+            self._arc_fillet(c, p, n)
+
+    def _arc_fillet(self, c: ControlPoint, p: ControlPoint, n: ControlPoint):
         radius = c.lin_d * c.lin_d_to_r
         num_segments = math.floor(radius * c.angle / self.mm_per_arc_segment)
         if num_segments < 1:
@@ -226,16 +242,46 @@ class RoundedPath:
         vn = _vnorm(_vecto(c, n))
         rotaxis = _vnorm(_cross(vp, vn))
         start = _vadd(c.vec, _vmul(vp, c.lin_d))
-        spoke = _vmul(_vrot(vp, math.pi/2, rotaxis), -radius)
+        spoke = _vmul(_vrot(vp, math.pi / 2.0, rotaxis), -radius)
         center = _vadd(start, _vmul(spoke, -1.0))
 
         # We are rotating counter the segment rotation.
         rot_transform = _vrot_transform(-c.angle / num_segments, rotaxis)
         rotspoke = spoke
         self._g0p(c, _vadd(center, rotspoke))
-        for step in range(0, num_segments):
+        for _ in range(num_segments):
             rotspoke = _vtransform(rotspoke, rot_transform)
             self._g0p(c, _vadd(center, rotspoke))
+
+    def _arc_bezier(self, c: ControlPoint, p: ControlPoint, n: ControlPoint):
+        if np is None:
+            raise RuntimeError("NumPy is required for bezier algorithm")
+        radius = c.lin_d * c.lin_d_to_r
+        num_segments = math.floor(radius * c.angle / self.mm_per_arc_segment)
+        if num_segments < 1:
+            self._g0(c)
+            return
+        vp = _vnorm(_vecto(c, p))
+        vn = _vnorm(_vecto(c, n))
+        rotaxis = _vnorm(_cross(vp, vn))
+
+        start = _vadd(c.vec, _vmul(vp, c.lin_d))
+        spoke = _vmul(_vrot(vp, math.pi / 2.0, rotaxis), -radius)
+        center = _vadd(start, _vmul(spoke, -1.0))
+
+        # Convert tangential points into a quadratic Bezier through the corner
+        np_n = np.array(vn) * c.lin_d  # next tangential point (vector from c)
+        np_p = np.array(vp) * c.lin_d  # previous tangential point (vector from c)
+        np_c = np.array(c.vec)         # corner itself
+        straight_len = math.hypot(*(np_n - np_p))
+        n_pts = max(2, math.trunc(straight_len / self.mm_per_arc_segment))
+        bcurve = _Bezier.bezier_curve([np_p + np_c, np_c, np_n + np_c], n=n_pts)
+
+        # Emit: first move to entry tangent, then follow Bezier in reverse so
+        # that curves are generated from incoming to outgoing segment order.
+        self._g0p(c, _vadd(center, spoke))
+        for point in reversed(bcurve):
+            self._g0p(c, point)
 
     def _g0(self, p: ControlPoint):
         self._g0p(p, p.vec)
@@ -250,6 +296,57 @@ class RoundedPath:
             self.G0_params.pop('F', None)
         self.lastg0 = vec
         self.real_G0(self.G0_cmd)
+
+
+# This module has been adapted from code written by Ingo Donasch <ingo@donasch.net>
+# Sourced from https://github.com/idonasch/klipper-toolchanger/blob/bezier/klipper/extras/bezier_path.py
+class _Bezier:
+    """Utility class for n-point Bezier curves."""
+
+    @staticmethod
+    def _comb(n: int, k: int) -> float:
+        """N choose k"""
+        return math.factorial(n) / math.factorial(k) / math.factorial(n - k)
+
+    @classmethod
+    def _bernstein_poly(cls, i: int, n: int, t):
+        """The Bernstein polynomial of n, i as a function of t"""
+        return cls._comb(n, i) * (t ** (n - i)) * (1 - t) ** i
+
+    @classmethod
+    def bezier_curve(cls, points, n=1000):
+        """
+           Given a set of control points, return the
+           bezier curve defined by the control points.
+
+           points should be a list of lists, or list of tuples
+           such as [ [1,1,1], 
+                     [2,3,2], 
+                     [4,5,4], ..[Xn, Yn, Zn] ]
+            n is the number of points at which to return the curve, defaults to 1000
+
+            See http://processingjs.nihongoresources.com/bezierinfo/
+        """
+        if np is None:
+            raise RuntimeError("NumPy is required for 'bezier' algorithm but not available.")
+        
+        nPoints = len(points)
+        xPoints = np.array([p[0] for p in points])
+        yPoints = np.array([p[1] for p in points])
+        zPoints = np.array([p[2] for p in points])
+
+        t = np.linspace(0.0, 1.0, n)
+
+        polynomial_array = np.array(
+            [cls._bernstein_poly(i, nPoints-1, t) for i in range(0, nPoints)]
+        )
+
+        xvals = np.dot(xPoints, polynomial_array)
+        yvals = np.dot(yPoints, polynomial_array)
+        zvals = np.dot(zPoints, polynomial_array)
+
+        return np.transpose([xvals, yvals, zvals])
+
 
 def load_config(config):
     return RoundedPath(config)
